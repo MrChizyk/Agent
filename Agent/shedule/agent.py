@@ -5,14 +5,14 @@
     /start  — підписатися на нагадування (бот запам'ятає ваш chat_id)
     /today  — розклад на сьогодні
     /next   — яка пара зараз/наступна і скільки часу лишилось
-    /week   — розклад на весь тиждень (з кнопками по днях)
+    /week   — розклад на весь тиждень у вигляді картинки (з кнопками по днях)
 
 Розклад лежить у файлі schedule.json поруч зі скриптом.
 Ключі "0".."6" — дні тижня: 0 = понеділок, 1 = вівторок, ..., 6 = неділя
 (як у Python: datetime.weekday()).
 
 Встановлення залежностей:
-    pip install "python-telegram-bot[job-queue]" --upgrade
+    pip install "python-telegram-bot[job-queue]" matplotlib --upgrade
 
 Запуск:
     python bot.py
@@ -22,7 +22,13 @@ import json
 import logging
 import os
 from datetime import datetime, time, timedelta
+from io import BytesIO
 from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")  # без графічного середовища (сервер/консоль)
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -134,6 +140,111 @@ def format_week_overview(schedule: dict, today_idx: int | None = None) -> str:
     return "\n".join(lines)
 
 
+# Кольорова схема картинки (темна тема, як у Telegram-клієнтах)
+_BG_COLOR = "#0e0e13"
+_HEADER_COLOR = "#1c1c24"
+_HEADER_TODAY_COLOR = "#7c5cff"
+_CELL_COLOR = "#1a1a21"
+_CELL_CURRENT_COLOR = "#2a2050"
+_BORDER_CURRENT = "#7c5cff"
+_TEXT_MAIN = "#f2f2f5"
+_TEXT_DIM = "#9a9aa5"
+_EMPTY_TEXT = "#55555f"
+
+
+def render_week_image(schedule: dict, today_idx: int, highlight_now: datetime | None = None) -> BytesIO:
+    """Малює розклад на тиждень як зображення (7 колонок-днів) і повертає PNG у BytesIO."""
+    day_lessons = [get_day_lessons(schedule, i) for i in range(7)]
+    max_rows = max((len(lst) for lst in day_lessons), default=0) or 1
+
+    col_w, header_h, row_h, title_h = 2.5, 0.75, 1.05, 0.55
+    fig_w = col_w * 7
+    fig_h = title_h + header_h + row_h * max_rows + 0.25
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=170)
+    fig.patch.set_facecolor(_BG_COLOR)
+    ax.set_facecolor(_BG_COLOR)
+    ax.set_xlim(0, fig_w)
+    ax.set_ylim(0, fig_h)
+    ax.invert_yaxis()
+    ax.axis("off")
+
+    ax.text(
+        fig_w / 2, title_h / 2, "Розклад на тиждень",
+        ha="center", va="center", fontsize=15, color=_TEXT_MAIN, fontweight="bold",
+    )
+
+    current_time = highlight_now.time() if highlight_now else None
+
+    for i in range(7):
+        x0 = i * col_w
+        is_today = i == today_idx
+        header_color = _HEADER_TODAY_COLOR if is_today else _HEADER_COLOR
+        header_text_color = "#ffffff" if is_today else _TEXT_MAIN
+
+        # заголовок дня
+        ax.add_patch(FancyBboxPatch(
+            (x0 + 0.05, title_h), col_w - 0.1, header_h - 0.08,
+            boxstyle="round,pad=0,rounding_size=0.08",
+            linewidth=0, facecolor=header_color,
+        ))
+        ax.text(
+            x0 + col_w / 2, title_h + header_h / 2, DAY_SHORT[i],
+            ha="center", va="center", fontsize=13, color=header_text_color, fontweight="bold",
+        )
+
+        lessons = day_lessons[i]
+        if not lessons:
+            ax.text(
+                x0 + col_w / 2, title_h + header_h + (row_h * max_rows) / 2,
+                "вихідний", ha="center", va="center", fontsize=10,
+                color=_EMPTY_TEXT, style="italic",
+            )
+            continue
+
+        for r in range(max_rows):
+            y0 = title_h + header_h + r * row_h
+            if r >= len(lessons):
+                continue
+
+            lesson = lessons[r]
+            is_current = False
+            if is_today and current_time is not None:
+                is_current = parse_time(lesson["start"]) <= current_time <= parse_time(lesson["end"])
+
+            cell_color = _CELL_CURRENT_COLOR if is_current else _CELL_COLOR
+            edge_color = _BORDER_CURRENT if is_current else "none"
+
+            ax.add_patch(FancyBboxPatch(
+                (x0 + 0.05, y0 + 0.05), col_w - 0.1, row_h - 0.1,
+                boxstyle="round,pad=0,rounding_size=0.06",
+                linewidth=1.4 if is_current else 0,
+                edgecolor=edge_color, facecolor=cell_color,
+            ))
+
+            ax.text(
+                x0 + col_w / 2, y0 + 0.28,
+                f"{lesson['start']}–{lesson['end']}",
+                ha="center", va="center", fontsize=8.3, color=_TEXT_DIM,
+            )
+            ax.text(
+                x0 + col_w / 2, y0 + row_h / 2 + 0.06,
+                lesson["subject"], ha="center", va="center", fontsize=9.3,
+                color=_TEXT_MAIN, fontweight="bold" if is_current else "normal",
+                wrap=True,
+            )
+            ax.text(
+                x0 + col_w / 2, y0 + row_h - 0.22,
+                lesson["room"], ha="center", va="center", fontsize=7.8, color=_TEXT_DIM,
+            )
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.15)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 def week_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(DAY_SHORT[i], callback_data=f"day:{i}") for i in range(7)
@@ -181,9 +292,11 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     schedule = load_schedule()
     now = datetime.now()
-    text = format_week_overview(schedule, today_idx=now.weekday())
-    await update.message.reply_text(
-        text, parse_mode=ParseMode.HTML, reply_markup=week_keyboard()
+    image = render_week_image(schedule, today_idx=now.weekday(), highlight_now=now)
+    await update.message.reply_photo(
+        photo=image,
+        caption="🗓 Розклад на тиждень\n👇 Натисни день, щоб побачити деталі",
+        reply_markup=week_keyboard(),
     )
 
 
@@ -195,9 +308,11 @@ async def week_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     now = datetime.now()
 
     if query.data == "week":
-        text = format_week_overview(schedule, today_idx=now.weekday())
-        await query.edit_message_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=week_keyboard()
+        image = render_week_image(schedule, today_idx=now.weekday(), highlight_now=now)
+        await query.message.reply_photo(
+            photo=image,
+            caption="🗓 Розклад на тиждень\n👇 Натисни день, щоб побачити деталі",
+            reply_markup=week_keyboard(),
         )
         return
 
@@ -208,7 +323,7 @@ async def week_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             highlight = now if day_idx == now.weekday() else None
             blocks.append(format_day_block(day_idx, lessons, highlight_now=highlight))
         text = "\n\n".join(blocks)
-        await query.edit_message_text(
+        await query.message.reply_text(
             text, parse_mode=ParseMode.HTML, reply_markup=back_to_week_keyboard()
         )
         return
@@ -218,7 +333,7 @@ async def week_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     lessons = get_day_lessons(schedule, day_idx)
     highlight = now if day_idx == now.weekday() else None
     text = format_day_block(day_idx, lessons, highlight_now=highlight)
-    await query.edit_message_text(
+    await query.message.reply_text(
         text, parse_mode=ParseMode.HTML, reply_markup=back_to_week_keyboard()
     )
 
